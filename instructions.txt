@@ -1,0 +1,1 @@
+1. Write code such that all models and datasets are downloaded in the home folder. Deleting these folder should remove everything from that machine
