@@ -1,45 +1,182 @@
-# Monet vs Qwen2.5-VL: coding eval data
+# Monet vs Qwen2.5-VL: coding eval
 
-Downloads LiveCodeBench-lite and HumanEval+ from Hugging Face, builds two
-LiveCodeBench subsets (easy problems, and problems released after Qwen2.5-VL),
-and saves stats for each dataset.
+Compares **Qwen2.5-VL-7B-Instruct** with **Monet-7B** (Qwen2.5-VL-7B fine-tuned for
+latent visual reasoning) on text-only coding problems: LiveCodeBench-lite subsets and
+HumanEval+. Both models run as GGUF files through
+[llama-cpp-python](https://github.com/abetlen/llama-cpp-python), so a 16 GB GPU is enough.
 
-Everything downloaded from Hugging Face stays inside this folder, so deleting
-the folder removes it all.
+Everything downloaded (data, models) stays inside this folder, so deleting the folder
+removes it all.
 
 ## Requirements
 
-- bash
+- bash, git
 - [uv](https://docs.astral.sh/uv/): `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- For evaluation (GPU machine only):
+  - NVIDIA GPU with 16 GB VRAM and a recent driver (`nvidia-smi` works)
+  - CUDA toolkit 12.x with `nvcc` (`nvcc --version` works; usually `/usr/local/cuda/bin/nvcc`)
+  - `cmake` ≥ 3.24, `gcc`/`g++`, `make` (Ubuntu: `sudo apt install build-essential cmake`)
 
-## Run
+## 1. Data
 
 ```bash
 bash setup.sh
 ```
 
-This creates `.venv/` with uv, installs `huggingface_hub`, and runs
-`prepare_datasets.py`.
+This creates `.venv/` with uv (Python 3.13), installs `huggingface_hub`, and runs
+`prepare_datasets.py`, which downloads LiveCodeBench-lite and HumanEval+ into `data/`
+(about 4.5 GB). See `DATASET.md` for the file formats.
 
-## Later sessions
+## 2. llama.cpp (GPU machine)
+
+`llama-cpp-python` is the Python binding for llama.cpp. It ships llama.cpp as source
+and compiles it on install; set `CMAKE_ARGS` to get a CUDA build. There are no
+prebuilt CUDA wheels for Python 3.13, so it is always built from source.
+
+Either run the script:
+
+```bash
+bash setup_eval.sh
+```
+
+or do the same steps by hand:
+
+```bash
+cd simple-latent-reasoning-check
+source env.sh                                    # keep downloads inside this folder
+
+export CUDACXX=$(which nvcc)                     # or /usr/local/cuda/bin/nvcc
+CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native" \
+  uv pip install --python .venv --no-cache --reinstall-package llama-cpp-python \
+  llama-cpp-python numpy
+
+# check: must print True
+.venv/bin/python -c "import llama_cpp; print(llama_cpp.__version__, llama_cpp.llama_supports_gpu_offload())"
+```
+
+- The compile takes several minutes.
+- `--no-cache` / `--reinstall-package` stop uv from reusing a CPU-only build.
+- `numpy` is needed by the HumanEval+ test harness.
+- `CMAKE_CUDA_ARCHITECTURES=native` builds only for the GPU in the machine. With
+  cmake < 3.24, use the GPU's compute capability instead, e.g. `=86` (RTX 30xx, A4000),
+  `=89` (RTX 40xx), `=75` (T4).
+
+Troubleshooting:
+
+| Symptom | Fix |
+|---|---|
+| `nvcc not found` / `No CMAKE_CUDA_COMPILER could be found` | Install the CUDA toolkit; `export CUDACXX=/usr/local/cuda/bin/nvcc` and `export PATH=/usr/local/cuda/bin:$PATH` |
+| check prints `False` | Built without CUDA. Rerun the install command exactly as above (with `CMAKE_ARGS`) |
+| `unknown model architecture: 'qwen2vl'` when loading | llama-cpp-python is too old. Rerun the install to get the latest version |
+| CUDA out of memory | Use a smaller quant (`--quant Q6_K`) or `--n-ctx 6144` |
+
+## 3. Run
+
+One model on one dataset per run:
 
 ```bash
 source env.sh
+
+# smoke test: downloads the model (8.1 GB, Q8_0) and runs 2 problems
+.venv/bin/python src/run_eval.py --model qwen25vl --dataset humanevalplus --limit 2
+
+.venv/bin/python src/run_eval.py --model qwen25vl --dataset lcb_easy
+.venv/bin/python src/run_eval.py --model monet    --dataset lcb_easy
+.venv/bin/python src/run_eval.py --model qwen25vl --dataset humanevalplus
+.venv/bin/python src/run_eval.py --model monet    --dataset humanevalplus
+.venv/bin/python src/run_eval.py --model qwen25vl --dataset lcb_post_qwen25vl
+.venv/bin/python src/run_eval.py --model monet    --dataset lcb_post_qwen25vl
 ```
 
-This sets `HF_HOME` to `hf_cache/` in this folder, so models downloaded later
-(Monet-7B, Qwen2.5-VL-7B, GGUFs) also land here. Run it before any download.
+| Argument | Default | Meaning |
+|---|---|---|
+| `--model` | required | `qwen25vl` or `monet` |
+| `--dataset` | required | `lcb_easy` (322), `lcb_post_qwen25vl` (131), `humanevalplus` (164), `lcb_full` (all LiveCodeBench, 1,055) |
+| `--quant` | `Q8_0` | GGUF file to use (`Q8_0`, `Q6_K`, `Q5_K_M`, `Q4_K_M`, …). Q8_0 is 8.1 GB and fits 16 GB with the KV cache |
+| `--model-path` | | Use a local `.gguf` file instead of downloading |
+| `--output-dir` | `results/<model>-<quant>/<dataset>` | Where results go |
+| `--n-ctx` | 8192 | Context window (prompt + answer) |
+| `--max-tokens` | 4096 | Max generated tokens per problem |
+| `--temperature` | 0 | 0 = greedy (deterministic). `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--seed` are also available |
+| `--n-gpu-layers` | -1 | -1 = whole model on GPU, 0 = CPU only |
+| `--test-timeout` | 6 | Seconds per test case |
+| `--limit` | | Only the first N problems |
+| `--retry-errors` | | Re-run problems whose status is `error` |
+| `--rescore` | | Re-run the tests on saved code without generating again |
+| `--force` | | Resume even if settings differ from the saved `config.json` |
+
+Models come from `mradermacher/Qwen2.5-VL-7B-Instruct-GGUF` and `mradermacher/Monet-7B-GGUF`
+and are cached in `hf_cache/hub/`. Only the language model file is used (no `mmproj`), since
+the tasks are text-only. Both models get exactly the same prompts and sampling settings.
+
+### Pause and resume
+
+Press Ctrl+C to pause. To continue, run the same command again. It reads `state.json` in
+the output folder and skips finished problems. The same applies after a crash or power
+loss: each result is written to disk before the problem is marked done, so at most the
+problem that was running is lost and redone. The script will not resume a folder created
+with different model/dataset/sampling settings unless you pass `--force`.
+
+## 4. Output
+
+```
+results/<model>-<quant>/<dataset>/
+├── config.json     run settings: model file, sampling, prompts, llama-cpp-python version
+├── state.json      finished problem ids, last_completed, status (running/paused/done)
+├── results.jsonl   one JSON record per problem (for analysis scripts)
+├── summary.json    pass@1 overall and by difficulty / platform / format, status counts
+└── traces/<id>.md  one readable file per problem, for manual review
+```
+
+Problem ids are the same for both models (`atcoder_abc301_a`, `leetcode_2727`,
+`HumanEval_0`), so `results/qwen25vl-Q8_0/lcb_easy/traces/X.md` and
+`results/monet-Q8_0/lcb_easy/traces/X.md` are the same problem.
+
+Each record in `results.jsonl` has:
+
+| Field | Content |
+|---|---|
+| `id`, `title`, `platform`, `difficulty`, `contest_date`, `format` | Problem info (`format`: `functional`, `stdin` or `humaneval`) |
+| `user_prompt`, `prompt_text` | The question as sent, and the full prompt after the chat template |
+| `raw_output` | The full model output, special tokens included: the reasoning trace |
+| `reasoning` | Text before the final code block |
+| `final_code` | The last ```` ```python ```` block: the answer that was tested |
+| `text_after_code` | Anything the model wrote after the code |
+| `status` | `pass`, `wrong_answer`, `runtime_error`, `timeout`, `no_code` (no code block), `truncated` (hit `--max-tokens` before giving code), `error` (script error, see `error`) |
+| `passed`, `num_tests`, `num_passed` | Verdict; tests run in order and stop at the first failure |
+| `first_failure` | Failing test's input, expected and actual output, and the traceback |
+| `finish_reason` | `stop` (model ended) or `length` (hit the token limit) |
+| `prompt_tokens`, `completion_tokens`, `gen_seconds`, `tokens_per_second` | Cost |
+| `latent_token_count`, `added_special_tokens` | Times the model emitted Monet's latent-mode token (id 151666) or other tokens Monet added to the Qwen vocabulary |
+
+LiveCodeBench problems are tested on public and hidden tests. HumanEval+ runs the
+EvalPlus `check()` harness (base + extra tests) as one test.
+
+### Notes
+
+- **Monet's latent mode does not run here.** Latent reasoning needs Monet's patched vLLM
+  runner. Under llama.cpp, Monet is a plain text model. If it emits token 151666, the
+  token is decoded as text and generation continues normally; `latent_token_count`
+  records how often that happens.
+- **HumanEval/32 fails for every solution.** In the `evalplus/humanevalplus` data its
+  test swaps the arguments to `_poly`, so even the reference solution fails. It counts as
+  a failure for both models; subtract it if you want pass@1 on the 163 scorable tasks.
+- **Generated code runs on your machine** in a subprocess with a 4 GB memory limit and
+  timeouts. Those limits stop runaway programs, not malicious ones.
+- `lcb_full` reads all ~4.4 GB of LiveCodeBench files once at startup to index them.
 
 ## Files
 
 | Path | What it is |
 |---|---|
-| `setup.sh` | Creates the uv environment and runs the script |
+| `setup.sh` | Creates the uv environment and builds the datasets |
+| `setup_eval.sh` | Installs llama-cpp-python with CUDA, plus numpy |
 | `env.sh` | Points Hugging Face downloads into this folder |
 | `prepare_datasets.py` | Downloads data, builds subsets, writes stats |
-| `DATASET.md` | Data locations and formats; read this before writing eval code |
-| `data/` | All datasets and stats (created by the script) |
-| `hf_cache/` | Hugging Face cache (created on first download) |
+| `src/run_eval.py` | Runs one model on one dataset, saves traces, resumes |
+| `src/code_exec.py` | Runs generated code against the tests |
+| `DATASET.md` | Data locations and formats |
+| `data/` | Datasets and stats (created by `setup.sh`) |
+| `hf_cache/` | Hugging Face cache, including the GGUF models |
+| `results/` | Evaluation output |
 | `.venv/` | Python environment |
-
-See `dataset.md` for what each data file contains.

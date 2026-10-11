@@ -12,3 +12,4 @@ data/
 .env
 .vscode/
 hf_cache/
+results/
