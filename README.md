@@ -217,11 +217,12 @@ EvalPlus `check()` harness (base + extra tests) as one test.
 | Path | What it is |
 |---|---|
 | `setup.sh` | Creates the uv environment and builds the datasets |
-| `setup_eval.sh` | Installs llama-cpp-python with CUDA, plus numpy |
+| `setup_eval.sh` | Installs llama-cpp-python with CUDA, plus numpy and pillow |
 | `env.sh` | Points Hugging Face downloads into this folder |
 | `prepare_datasets.py` | Downloads data, builds subsets, writes stats |
 | `src/run_eval.py` | Runs one model on one dataset, saves traces, resumes |
 | `src/code_exec.py` | Runs generated code against the tests |
+| `latent_probe/` | Separate check: does quantized Monet emit its latent token on V* image questions? See its README |
 | `DATASET.md` | Data locations and formats |
 | `data/` | Datasets and stats (created by `setup.sh`) |
 | `hf_cache/` | Hugging Face cache, including the GGUF models |

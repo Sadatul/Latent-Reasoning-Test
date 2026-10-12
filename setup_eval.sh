@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install llama-cpp-python built with CUDA, plus numpy, into .venv.
+# Install llama-cpp-python built with CUDA, plus numpy and pillow, into .venv.
 # Run on the GPU machine after setup.sh. See README.md for prerequisites.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,7 +23,7 @@ echo "using nvcc: $CUDACXX ($("$CUDACXX" --version | tail -n 1))"
 # reusing a CPU-only wheel built earlier.
 CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native" \
     uv pip install --python .venv --no-cache --reinstall-package llama-cpp-python \
-    llama-cpp-python numpy
+    llama-cpp-python numpy pillow
 
 .venv/bin/python - <<'EOF'
 import sys, llama_cpp
