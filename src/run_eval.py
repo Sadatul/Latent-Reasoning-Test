@@ -3,15 +3,16 @@ Evaluate one GGUF model on one coding dataset with llama-cpp-python.
 
     python src/run_eval.py --model qwen25vl --dataset lcb_easy
     python src/run_eval.py --model monet    --dataset humanevalplus --quant Q8_0
+    python src/run_eval.py --model qwen25vl --dataset lcb_easy --passes 5 --temperature 0.2
 
 Each run writes to results/<model>-<quant>/<dataset>/ (or --output-dir):
   config.json     settings of the run (checked on resume)
-  state.json      ids of finished problems; rerun the same command to resume
-  results.jsonl   one record per problem: prompt, full output, reasoning, code, verdict
+  state.json      ids of finished problems, attempts of the running one; rerun to resume
+  results.jsonl   one record per problem; per attempt: full output, reasoning, code, verdict
   traces/<id>.md  the same record, formatted for reading
-  summary.json    pass@1 overall and per difficulty / platform / format
+  summary.json    pass@1 ... pass@K overall and per difficulty / platform / format
 
-Ctrl+C pauses: at most the problem in progress is lost. See README.md.
+Ctrl+C pauses: at most the attempt in progress is lost. See README.md.
 """
 
 import argparse
@@ -199,8 +200,11 @@ class Generator:
             data = self.llm.detokenize(ids)
         return data.decode("utf-8", errors="replace")
 
-    def __call__(self, messages):
+    def __call__(self, messages, seed):
         a = self.args
+        # llama-cpp-python builds a fresh sampler from this seed on every generate(),
+        # so each attempt needs its own seed or all attempts come out identical.
+        self.llm.set_seed(seed)
         prompt = render_chat(self.template, messages)
         tokens = self.llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
         budget = min(a.max_tokens, a.n_ctx - len(tokens))
@@ -274,6 +278,40 @@ def unscored(status, error=None):
             "first_failure": {"error": error} if error else None}
 
 
+def pass_at_k(n, c, k):
+    """Unbiased pass@k from n attempts with c passing (Chen et al., 2021)."""
+    if n - c < k:
+        return 1.0
+    p = 1.0
+    for i in range(n - c + 1, n + 1):
+        p *= 1 - k / i
+    return 1 - p
+
+
+# Per-attempt fields. Records written before --passes existed held these at the top level.
+ATTEMPT_KEYS = ("raw_output", "finish_reason", "prompt_tokens", "completion_tokens", "gen_seconds",
+                "tokens_per_second", "latent_token_count", "added_special_tokens", "reasoning",
+                "final_code", "text_after_code", "status", "passed", "num_tests", "num_passed",
+                "first_failure", "error", "finished_at")
+
+
+def aggregate(rec):
+    """Fill a problem record's verdict from its attempts: passed if any attempt passed."""
+    atts = rec["attempts"]
+    rec["passes"] = len(atts)
+    rec["num_attempts_passed"] = sum(1 for a in atts if a["passed"])
+    rec["passed"] = rec["num_attempts_passed"] > 0
+    rec["status"] = "pass" if rec["passed"] else (atts[0]["status"] if atts else "error")
+    rec["finished_at"] = max((a.get("finished_at") or "" for a in atts), default=None)
+    return rec
+
+
+def normalize(rec):
+    if "attempts" not in rec:
+        rec["attempts"] = [{"attempt": 0, "seed": None, **{k: rec.pop(k, None) for k in ATTEMPT_KEYS}}]
+    return aggregate(rec)
+
+
 # ---------------------------------------------------------------- files
 
 def now():
@@ -313,7 +351,7 @@ def read_results(path):
         with open(path, encoding="utf-8") as f:
             for line in f:
                 try:
-                    records.append(json.loads(line))
+                    records.append(normalize(json.loads(line)))
                 except json.JSONDecodeError:
                     pass
     return records
@@ -324,27 +362,40 @@ def write_trace(out_dir, rec):
         return f"````{lang}\n{text if text is not None else '(none)'}\n````"
 
     meta = {k: rec.get(k) for k in ("id", "title", "dataset", "model", "quant", "platform", "difficulty",
-                                    "contest_date", "format", "status", "num_passed", "num_tests",
-                                    "finish_reason", "prompt_tokens", "completion_tokens", "gen_seconds",
-                                    "latent_token_count", "added_special_tokens")}
+                                    "contest_date", "format", "status", "passes", "num_attempts_passed")}
     parts = [
-        f"# {rec['id']} — {rec['status'].upper()}",
+        f"# {rec['id']} — {rec['status'].upper()} ({rec['num_attempts_passed']}/{rec['passes']} attempts passed)",
         fence(json.dumps(meta, indent=2, ensure_ascii=False), "json"),
         "## User prompt", fence(rec.get("user_prompt"), "text"),
-        "## Model output (full reasoning trace, special tokens included)", fence(rec.get("raw_output"), "text"),
-        "## Extracted final code", fence(rec.get("final_code"), "python"),
-        "## Test result", fence(json.dumps(rec.get("first_failure"), indent=2, ensure_ascii=False), "json"),
     ]
-    if rec.get("error"):
-        parts += ["## Error", fence(rec["error"], "text")]
+    for a in rec["attempts"]:
+        ameta = {k: a.get(k) for k in ("attempt", "seed", "status", "num_passed", "num_tests", "finish_reason",
+                                       "prompt_tokens", "completion_tokens", "gen_seconds",
+                                       "latent_token_count", "added_special_tokens")}
+        parts += [
+            f"## Attempt {a['attempt'] + 1} — {a['status'].upper()}",
+            fence(json.dumps(ameta, indent=2, ensure_ascii=False), "json"),
+            "### Model output (full reasoning trace, special tokens included)", fence(a.get("raw_output"), "text"),
+            "### Extracted final code", fence(a.get("final_code"), "python"),
+            "### Test result", fence(json.dumps(a.get("first_failure"), indent=2, ensure_ascii=False), "json"),
+        ]
+        if a.get("error"):
+            parts += ["### Error", fence(a["error"], "text")]
     (out_dir / "traces" / f"{rec['id']}.md").write_text("\n\n".join(parts) + "\n", encoding="utf-8")
 
 
 def summarize(records, total, config):
+    ks = range(1, max([config["passes"]] + [r["passes"] for r in records]) + 1)
+
     def rate(rs):
         n = len(rs)
         p = sum(1 for r in rs if r["passed"])
-        return {"n": n, "passed": p, "pass@1": round(p / n, 4) if n else None}
+        out = {"n": n, "passed": p}
+        for k in ks:  # pass@k needs at least k attempts on every problem
+            if n and all(r["passes"] >= k for r in rs):
+                out[f"pass@{k}"] = round(sum(pass_at_k(r["passes"], r["num_attempts_passed"], k)
+                                             for r in rs) / n, 4)
+        return out
 
     groups = {}
     for key in ("difficulty", "platform", "format"):
@@ -352,59 +403,81 @@ def summarize(records, total, config):
         for r in records:
             by[str(r.get(key))].append(r)
         groups[key] = {k: rate(v) for k, v in sorted(by.items())}
-    toks = [r["completion_tokens"] for r in records if r.get("completion_tokens") is not None]
+    atts = [a for r in records for a in r["attempts"]]
+    toks = [a["completion_tokens"] for a in atts if a.get("completion_tokens") is not None]
     return {
         "model": config["model"], "quant": config["quant"], "dataset": config["dataset"],
-        "completed": len(records), "total": total,
+        "passes": config["passes"], "completed": len(records), "total": total,
         "overall": rate(records),
         **{f"by_{k}": v for k, v in groups.items()},
         "status_counts": dict(Counter(r["status"] for r in records)),
-        "finish_reason_counts": dict(Counter(r.get("finish_reason") for r in records)),
+        "attempt_status_counts": dict(Counter(a["status"] for a in atts)),
+        "finish_reason_counts": dict(Counter(a.get("finish_reason") for a in atts)),
         "mean_completion_tokens": round(sum(toks) / len(toks), 1) if toks else None,
-        "problems_with_latent_token": sum(1 for r in records if r.get("latent_token_count")),
-        "problems_with_added_special_tokens": sum(1 for r in records if r.get("added_special_tokens")),
+        "problems_with_latent_token": sum(1 for r in records if any(a.get("latent_token_count") for a in r["attempts"])),
+        "problems_with_added_special_tokens": sum(1 for r in records
+                                                  if any(a.get("added_special_tokens") for a in r["attempts"])),
         "updated_at": now(),
     }
 
 
 # ---------------------------------------------------------------- main loop
 
-def run_problem(problem, gen, args, config):
+def run_problem(problem, gen, args, config, attempts, on_attempt):
+    """Generate and score attempts 0..passes-1 that are not already in `attempts`
+    (index -> attempt dict). on_attempt(attempts) is called after each one."""
     row = load_row(problem)
     user_prompt = build_user_prompt(problem, row)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}]
     rec = {"id": problem["id"], "title": problem["title"], "dataset": args.dataset, "model": args.model,
            "quant": config["quant"], "platform": problem["platform"], "difficulty": problem["difficulty"],
-           "contest_date": problem["contest_date"], "format": problem["format"], "user_prompt": user_prompt}
-    try:
-        g = gen(messages)
-        prompt_text = g.pop("prompt_text")
-        rec.update(g)
-        rec["reasoning"], rec["final_code"], rec["text_after_code"] = extract_code(g["raw_output"])
-        if rec["final_code"] is None:
-            verdict = unscored("truncated" if g["finish_reason"] == "length" else "no_code")
-        else:
-            verdict = score(problem, row, rec["final_code"], args.test_timeout)
-        rec.update(verdict)
-        rec["error"] = None
-        rec["prompt_text"] = prompt_text
-    except Exception:
-        rec.update(unscored("error"))
-        rec["error"] = traceback.format_exc()
-    rec["finished_at"] = now()
-    return rec
+           "contest_date": problem["contest_date"], "format": problem["format"], "user_prompt": user_prompt,
+           "prompt_text": render_chat(gen.template, messages)}
+    for i in range(args.passes):
+        if i in attempts:
+            continue
+        att = {"attempt": i, "seed": args.seed + i}
+        try:
+            g = gen(messages, att["seed"])
+            g.pop("prompt_text")
+            att.update(g)
+            att["reasoning"], att["final_code"], att["text_after_code"] = extract_code(g["raw_output"])
+            if att["final_code"] is None:
+                verdict = unscored("truncated" if g["finish_reason"] == "length" else "no_code")
+            else:
+                verdict = score(problem, row, att["final_code"], args.test_timeout)
+            att.update(verdict)
+            att["error"] = None
+        except Exception:
+            att.update(unscored("error"))
+            att["error"] = traceback.format_exc()
+        att["finished_at"] = now()
+        attempts[i] = att
+        on_attempt(attempts)
+        if args.passes > 1:
+            print(f"    {problem['id']} attempt {i + 1}/{args.passes} {att['status']:<13} "
+                  f"{att.get('completion_tokens') or 0:>5} tok {att.get('gen_seconds') or 0:>6.1f}s", flush=True)
+    rec["attempts"] = [attempts[i] for i in sorted(attempts)]
+    return aggregate(rec)
 
 
 def rescore(out_dir, problems, args, config):
     by_id = {p["id"]: p for p in problems}
     records = read_results(out_dir / "results.jsonl")
     for i, rec in enumerate(records, 1):
-        if rec.get("final_code") is None or rec["id"] not in by_id:
+        if rec["id"] not in by_id:
             continue
         p = by_id[rec["id"]]
-        rec.update(score(p, load_row(p), rec["final_code"], args.test_timeout))
+        row = None
+        for a in rec["attempts"]:
+            if a.get("final_code") is None:
+                continue
+            row = row or load_row(p)
+            a.update(score(p, row, a["final_code"], args.test_timeout))
+        aggregate(rec)
         write_trace(out_dir, rec)
-        print(f"[rescore {i}/{len(records)}] {rec['id']:<28} {rec['status']}")
+        print(f"[rescore {i}/{len(records)}] {rec['id']:<28} {rec['status']} "
+              f"({rec['num_attempts_passed']}/{rec['passes']})")
     write_jsonl_atomic(out_dir / "results.jsonl", records)
     return records
 
@@ -417,7 +490,9 @@ def main():
     ap.add_argument("--model-path", help="local GGUF file instead of downloading")
     ap.add_argument("--output-dir", help="default: results/<model>-<quant>/<dataset>")
     ap.add_argument("--n-ctx", type=int, default=8192, help="context window (prompt + output)")
-    ap.add_argument("--max-tokens", type=int, default=4096, help="max generated tokens per problem")
+    ap.add_argument("--max-tokens", type=int, default=4096, help="max generated tokens per attempt")
+    ap.add_argument("--passes", type=int, default=1,
+                    help="attempts per problem (k in pass@k); k > 1 needs --temperature > 0")
     ap.add_argument("--temperature", type=float, default=0.0, help="0 = greedy")
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=0, help="0 = disabled")
@@ -432,6 +507,11 @@ def main():
     ap.add_argument("--force", action="store_true", help="resume even if settings differ from config.json")
     ap.add_argument("--verbose", action="store_true", help="show llama.cpp logs")
     args = ap.parse_args()
+    if args.passes < 1:
+        ap.error("--passes must be at least 1")
+    if args.passes > 1 and args.temperature == 0:
+        ap.error("--passes > 1 with --temperature 0 (greedy) gives identical attempts; "
+                 "set a sampling temperature, e.g. --temperature 0.2")
 
     out_dir = Path(args.output_dir).resolve() if args.output_dir else ROOT / "results" / f"{args.model}-{args.quant}" / args.dataset
     (out_dir / "traces").mkdir(parents=True, exist_ok=True)
@@ -444,7 +524,7 @@ def main():
     config = {"model": args.model, "quant": args.quant, "gguf_file": gguf_file, "dataset": args.dataset,
               "n_ctx": args.n_ctx, "max_tokens": args.max_tokens, "temperature": args.temperature,
               "top_p": args.top_p, "top_k": args.top_k, "min_p": args.min_p,
-              "repeat_penalty": args.repeat_penalty, "seed": args.seed,
+              "repeat_penalty": args.repeat_penalty, "seed": args.seed, "passes": args.passes,
               "prompt_version": PROMPT_VERSION, "system_prompt": SYSTEM_PROMPT,
               "reasoning_instruction": REASONING_INSTRUCTION}
 
@@ -459,15 +539,7 @@ def main():
     done = set(state["completed"])
     records = [r for r in read_results(results_path) if r["id"] in done]
     records = list({r["id"]: r for r in records}.values())  # one record per id
-    if args.retry_errors:
-        records = [r for r in records if r["status"] != "error"]
-    done = {r["id"] for r in records}
     write_jsonl_atomic(results_path, records)  # drop lines not confirmed by state.json
-
-    def save_state(status):
-        write_json_atomic(state_path, {"completed": [r["id"] for r in records], "total": len(problems),
-                                       "last_completed": records[-1]["id"] if records else None,
-                                       "status": status, "updated_at": now()})
 
     if args.rescore:
         records = rescore(out_dir, problems, args, config)
@@ -475,8 +547,44 @@ def main():
         print(json.dumps(summarize(records, len(problems), config)["overall"]))
         return
 
+    # Attempts already made for problems that are not finished, by id -> {index: attempt}.
+    # They come from the problem that was running when the last run stopped, from
+    # records with fewer than --passes attempts (--passes was raised), and from
+    # records whose errored attempts --retry-errors will redo.
+    pending = {}
+    in_progress = state.get("in_progress")
+    if in_progress:
+        pending[in_progress["id"]] = {a["attempt"]: a for a in in_progress["attempts"]}
+    kept = []
+    for r in records:
+        atts = r["attempts"]
+        if args.retry_errors:
+            atts = [a for a in atts if a["status"] != "error"]
+        if len(atts) < len(r["attempts"]) or len(atts) < args.passes:
+            pending[r["id"]] = {a["attempt"]: a for a in atts}
+        else:
+            kept.append(r)
+    if args.retry_errors:
+        for atts in pending.values():
+            for i in [i for i, a in atts.items() if a["status"] == "error"]:
+                del atts[i]
+    if len(kept) < len(records):
+        records = kept
+        write_jsonl_atomic(results_path, records)
+    done = {r["id"] for r in records}
+    current = None  # (id, attempts) of the problem being generated
+
+    def save_state(status):
+        write_json_atomic(state_path, {"completed": [r["id"] for r in records], "total": len(problems),
+                                       "last_completed": records[-1]["id"] if records else None,
+                                       "in_progress": ({"id": current[0], "attempts": [current[1][i] for i in
+                                                                                       sorted(current[1])]}
+                                                       if current else None),
+                                       "status": status, "updated_at": now()})
+
     todo = [p for p in problems if p["id"] not in done]
-    print(f"{args.model} on {args.dataset}: {len(problems)} problems, {len(done)} already done, {len(todo)} to run")
+    print(f"{args.model} on {args.dataset}: {len(problems)} problems, {len(done)} already done, {len(todo)} to run"
+          f", {args.passes} attempt(s) each")
     print(f"output: {out_dir}")
     if not todo:
         save_state("done")
@@ -495,15 +603,21 @@ def main():
 
     try:
         for n, problem in enumerate(todo, len(done) + 1):
-            rec = run_problem(problem, gen, args, config)
+            current = (problem["id"], pending.pop(problem["id"], {}))
+            rec = run_problem(problem, gen, args, config, current[1],
+                              lambda _: save_state("running"))  # each attempt saved as it finishes
             append_jsonl(results_path, rec)       # 1) result on disk
             records.append(rec)
+            current = None
             save_state("running")      # 2) then mark it completed
             write_trace(out_dir, rec)
             passed = sum(r["passed"] for r in records)
+            atts = rec["attempts"]
             print(f"[{n}/{len(problems)}] {rec['id']:<28} {rec['status']:<13} "
-                  f"{rec.get('completion_tokens') or 0:>5} tok {rec.get('gen_seconds') or 0:>6.1f}s  "
-                  f"pass@1 so far {passed}/{len(records)}", flush=True)
+                  f"{rec['num_attempts_passed']}/{rec['passes']} attempts passed "
+                  f"{sum(a.get('completion_tokens') or 0 for a in atts):>6} tok "
+                  f"{sum(a.get('gen_seconds') or 0 for a in atts):>7.1f}s  "
+                  f"pass@{args.passes} so far {passed}/{len(records)}", flush=True)
             if n % 10 == 0:
                 write_json_atomic(out_dir / "summary.json", summarize(records, len(problems), config))
     except KeyboardInterrupt:

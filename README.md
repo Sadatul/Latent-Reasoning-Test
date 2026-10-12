@@ -96,12 +96,13 @@ source env.sh
 | `--model-path` | | Use a local `.gguf` file instead of downloading |
 | `--output-dir` | `results/<model>-<quant>/<dataset>` | Where results go |
 | `--n-ctx` | 8192 | Context window (prompt + answer) |
-| `--max-tokens` | 4096 | Max generated tokens per problem |
+| `--max-tokens` | 4096 | Max generated tokens per attempt |
+| `--passes` | 1 | Attempts per problem, the k in pass@k (any k ≥ 1). k > 1 needs `--temperature` > 0 |
 | `--temperature` | 0 | 0 = greedy (deterministic). `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--seed` are also available |
 | `--n-gpu-layers` | -1 | -1 = whole model on GPU, 0 = CPU only |
 | `--test-timeout` | 6 | Seconds per test case |
 | `--limit` | | Only the first N problems |
-| `--retry-errors` | | Re-run problems whose status is `error` |
+| `--retry-errors` | | Re-run attempts whose status is `error` |
 | `--rescore` | | Re-run the tests on saved code without generating again |
 | `--force` | | Resume even if settings differ from the saved `config.json` |
 
@@ -109,12 +110,30 @@ Models come from `mradermacher/Qwen2.5-VL-7B-Instruct-GGUF` and `mradermacher/Mo
 and are cached in `hf_cache/hub/`. Only the language model file is used (no `mmproj`), since
 the tasks are text-only. Both models get exactly the same prompts and sampling settings.
 
+### pass@k
+
+`--passes K` samples K answers per problem; attempt `i` (0-based) uses seed `--seed + i`,
+so a rerun gives the same attempts. Greedy decoding would give K identical answers, so
+K > 1 requires a temperature, e.g.:
+
+```bash
+.venv/bin/python src/run_eval.py --model qwen25vl --dataset lcb_easy --passes 5 --temperature 0.2 \
+  --output-dir results/qwen25vl-Q8_0/lcb_easy-pass5
+```
+
+A problem counts as solved if any attempt passes. `summary.json` reports pass@1 … pass@K
+with the unbiased estimator of Chen et al. (2021), so one `--passes 5` run also gives
+pass@1 and pass@3. Use a separate `--output-dir` per temperature: a folder created with
+greedy decoding will not resume with a different temperature. Raising `--passes` on an
+existing folder (same settings otherwise) tops up every problem with the missing attempts.
+
 ### Pause and resume
 
 Press Ctrl+C to pause. To continue, run the same command again. It reads `state.json` in
 the output folder and skips finished problems. The same applies after a crash or power
-loss: each result is written to disk before the problem is marked done, so at most the
-problem that was running is lost and redone. The script will not resume a folder created
+loss: each result is written to disk before the problem is marked done, and each finished
+attempt of the running problem is kept in `state.json` (`in_progress`), so at most the
+attempt that was running is lost and redone. The script will not resume a folder created
 with different model/dataset/sampling settings unless you pass `--force`.
 
 ## 4. Output
@@ -122,9 +141,9 @@ with different model/dataset/sampling settings unless you pass `--force`.
 ```
 results/<model>-<quant>/<dataset>/
 ├── config.json     run settings: model file, sampling, prompts, llama-cpp-python version
-├── state.json      finished problem ids, last_completed, status (running/paused/done)
+├── state.json      finished problem ids, last_completed, in_progress attempts, status (running/paused/done)
 ├── results.jsonl   one JSON record per problem (for analysis scripts)
-├── summary.json    pass@1 overall and by difficulty / platform / format, status counts
+├── summary.json    pass@1 … pass@K overall and by difficulty / platform / format, status counts
 └── traces/<id>.md  one readable file per problem, for manual review
 ```
 
@@ -132,12 +151,21 @@ Problem ids are the same for both models (`atcoder_abc301_a`, `leetcode_2727`,
 `HumanEval_0`), so `results/qwen25vl-Q8_0/lcb_easy/traces/X.md` and
 `results/monet-Q8_0/lcb_easy/traces/X.md` are the same problem.
 
-Each record in `results.jsonl` has:
+Each record in `results.jsonl` is one problem:
 
 | Field | Content |
 |---|---|
 | `id`, `title`, `platform`, `difficulty`, `contest_date`, `format` | Problem info (`format`: `functional`, `stdin` or `humaneval`) |
 | `user_prompt`, `prompt_text` | The question as sent, and the full prompt after the chat template |
+| `passes`, `num_attempts_passed` | Number of attempts, and how many passed |
+| `passed`, `status` | `true` / `pass` if any attempt passed; otherwise `status` is the first attempt's status |
+| `attempts` | List with one entry per attempt, fields below |
+
+Each entry of `attempts` has:
+
+| Field | Content |
+|---|---|
+| `attempt`, `seed` | Attempt index (0-based) and the sampling seed it used |
 | `raw_output` | The full model output, special tokens included: the reasoning trace |
 | `reasoning` | Text before the final code block |
 | `final_code` | The last ```` ```python ```` block: the answer that was tested |
