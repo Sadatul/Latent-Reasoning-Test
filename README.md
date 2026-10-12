@@ -94,9 +94,10 @@ source env.sh
 | `--dataset` | required | `lcb_easy` (322), `lcb_post_qwen25vl` (131), `humanevalplus` (164), `lcb_full` (all LiveCodeBench, 1,055) |
 | `--quant` | `Q8_0` | GGUF file to use (`Q8_0`, `Q6_K`, `Q5_K_M`, `Q4_K_M`, …). Q8_0 is 8.1 GB and fits 16 GB with the KV cache |
 | `--model-path` | | Use a local `.gguf` file instead of downloading |
-| `--output-dir` | `results/<model>-<quant>/<dataset>` | Where results go |
+| `--output-dir` | `results/<model>-<quant>/<dataset>` | Where results go (`<dataset>-prompt<N>` for `--prompt-style` N > 0) |
 | `--n-ctx` | 8192 | Context window (prompt + answer) |
 | `--max-tokens` | 4096 | Max generated tokens per attempt |
+| `--prompt-style` | 0 | 0 = original prompt; 1 = stricter prompt that insists on a final code block (see below). Default set by `PROMPT_STYLE` in `src/run_eval.py` |
 | `--passes` | 1 | Attempts per problem, the k in pass@k (any k ≥ 1). k > 1 needs `--temperature` > 0 |
 | `--temperature` | 0 | 0 = greedy (deterministic). `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--seed` are also available |
 | `--n-gpu-layers` | -1 | -1 = whole model on GPU, 0 = CPU only |
@@ -109,6 +110,24 @@ source env.sh
 Models come from `mradermacher/Qwen2.5-VL-7B-Instruct-GGUF` and `mradermacher/Monet-7B-GGUF`
 and are cached in `hf_cache/hub/`. Only the language model file is used (no `mmproj`), since
 the tasks are text-only. Both models get exactly the same prompts and sampling settings.
+
+### Prompt styles
+
+Prompts are defined in `PROMPT_STYLES` in `src/run_eval.py`:
+
+- **0** (default): the original prompt: reason step by step, then give the solution in a
+  ```` ```python ```` block. Works well for Qwen2.5-VL.
+- **1**: for Monet, which often stops without writing code under style 0 (`no_code`). It asks
+  for short reasoning, says only the code block is graded and a missing block scores zero,
+  forbids `\boxed{}` / plain-text answers, and ends with an explicit answer template.
+
+```bash
+.venv/bin/python src/run_eval.py --model monet --dataset lcb_easy --prompt-style 1   # -> results/monet-Q8_0/lcb_easy-prompt1
+```
+
+Change `PROMPT_STYLE` at the top of `src/run_eval.py` to change the default. The style is
+saved in `config.json` and in every record, and a folder will not resume with a different
+style. For a fair comparison, run both models with the same style.
 
 ### pass@k
 

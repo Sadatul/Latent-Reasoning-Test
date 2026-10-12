@@ -49,16 +49,47 @@ MONET_LATENT_START_ID = 151666
 
 # Bump when prompts change, so a resumed run cannot mix two prompt versions.
 PROMPT_VERSION = 1
-SYSTEM_PROMPT = "You are an expert Python programmer."
-REASONING_INSTRUCTION = (
-    "First, think through the problem step by step: restate what is asked, work out an "
-    "algorithm, and check it against the examples. Then give your complete solution as a "
-    "single ```python code block at the end of your answer."
-)
+
+# Prompt style used when --prompt-style is not given.
+#   0: original prompt; works well for Qwen2.5-VL.
+#   1: pushes harder for a final code block, for models (Monet) that often stop without one.
+PROMPT_STYLE = 0
+PROMPT_STYLES = {
+    0: {
+        "system": "You are an expert Python programmer.",
+        "instruction": (
+            "First, think through the problem step by step: restate what is asked, work out an "
+            "algorithm, and check it against the examples. Then give your complete solution as a "
+            "single ```python code block at the end of your answer."
+        ),
+        "format_tail": "",
+    },
+    1: {
+        "system": (
+            "You are an expert Python programmer. You solve coding problems and always end your "
+            "answer with the complete solution in a ```python code block."
+        ),
+        "instruction": (
+            "Think through the problem briefly: work out an algorithm and check it against the "
+            "examples. Keep this reasoning short. Then you MUST write your complete solution as a "
+            "single ```python code block at the end of your answer. Only that code block is graded: "
+            "an answer without it scores zero, so never stop before writing it. Do not give the "
+            "answer as plain text or in \\boxed{}."
+        ),
+        "format_tail": (
+            "\n\nUse exactly this format:\n"
+            "<brief reasoning>\n"
+            "```python\n"
+            "<complete solution code>\n"
+            "```"
+        ),
+    },
+}
 
 # Settings that must match for a run to be resumed.
 CONFIG_KEYS = ["model", "quant", "gguf_file", "dataset", "n_ctx", "max_tokens", "temperature",
-               "top_p", "top_k", "min_p", "repeat_penalty", "seed", "prompt_version", "system_prompt"]
+               "top_p", "top_k", "min_p", "repeat_penalty", "seed", "prompt_version", "prompt_style",
+               "system_prompt"]
 
 
 # ---------------------------------------------------------------- data
@@ -138,13 +169,14 @@ def load_row(problem):
 
 # ---------------------------------------------------------------- prompts
 
-def build_user_prompt(problem, row):
+def build_user_prompt(problem, row, style):
+    s = PROMPT_STYLES[style]
     if problem["format"] == "humaneval":
         return (
             "Complete the following Python function.\n\n"
             f"```python\n{row['prompt']}```\n\n"
-            f"{REASONING_INSTRUCTION} The code block must contain the full function "
-            "(imports, signature and body), not only the body."
+            f"{s['instruction']} The code block must contain the full function "
+            f"(imports, signature and body), not only the body.{s['format_tail']}"
         )
     if problem["format"] == "functional":
         return (
@@ -152,13 +184,13 @@ def build_user_prompt(problem, row):
             "### Format: You will use the following starter code to write the solution to the "
             "problem and enclose your code within delimiters.\n"
             f"```python\n{row['starter_code']}\n```\n\n"
-            f"{REASONING_INSTRUCTION}"
+            f"{s['instruction']}{s['format_tail']}"
         )
     return (
         f"### Question:\n{row['question_content']}\n\n"
         "### Format: Read the inputs from stdin, solve the problem and write the answer to "
         "stdout (do not directly test on the sample inputs). Write a complete Python program.\n\n"
-        f"{REASONING_INSTRUCTION}"
+        f"{s['instruction']}{s['format_tail']}"
     )
 
 
@@ -362,7 +394,8 @@ def write_trace(out_dir, rec):
         return f"````{lang}\n{text if text is not None else '(none)'}\n````"
 
     meta = {k: rec.get(k) for k in ("id", "title", "dataset", "model", "quant", "platform", "difficulty",
-                                    "contest_date", "format", "status", "passes", "num_attempts_passed")}
+                                    "contest_date", "format", "prompt_style", "status", "passes",
+                                    "num_attempts_passed")}
     parts = [
         f"# {rec['id']} — {rec['status'].upper()} ({rec['num_attempts_passed']}/{rec['passes']} attempts passed)",
         fence(json.dumps(meta, indent=2, ensure_ascii=False), "json"),
@@ -407,7 +440,8 @@ def summarize(records, total, config):
     toks = [a["completion_tokens"] for a in atts if a.get("completion_tokens") is not None]
     return {
         "model": config["model"], "quant": config["quant"], "dataset": config["dataset"],
-        "passes": config["passes"], "completed": len(records), "total": total,
+        "passes": config["passes"], "prompt_style": config.get("prompt_style", 0),
+        "completed": len(records), "total": total,
         "overall": rate(records),
         **{f"by_{k}": v for k, v in groups.items()},
         "status_counts": dict(Counter(r["status"] for r in records)),
@@ -427,10 +461,12 @@ def run_problem(problem, gen, args, config, attempts, on_attempt):
     """Generate and score attempts 0..passes-1 that are not already in `attempts`
     (index -> attempt dict). on_attempt(attempts) is called after each one."""
     row = load_row(problem)
-    user_prompt = build_user_prompt(problem, row)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}]
+    user_prompt = build_user_prompt(problem, row, args.prompt_style)
+    messages = [{"role": "system", "content": PROMPT_STYLES[args.prompt_style]["system"]},
+                {"role": "user", "content": user_prompt}]
     rec = {"id": problem["id"], "title": problem["title"], "dataset": args.dataset, "model": args.model,
-           "quant": config["quant"], "platform": problem["platform"], "difficulty": problem["difficulty"],
+           "quant": config["quant"], "prompt_style": args.prompt_style, "platform": problem["platform"],
+           "difficulty": problem["difficulty"],
            "contest_date": problem["contest_date"], "format": problem["format"], "user_prompt": user_prompt,
            "prompt_text": render_chat(gen.template, messages)}
     for i in range(args.passes):
@@ -488,11 +524,13 @@ def main():
     ap.add_argument("--dataset", required=True, choices=DATASETS)
     ap.add_argument("--quant", default="Q8_0", help="GGUF quantisation suffix (default Q8_0, 8.1 GB)")
     ap.add_argument("--model-path", help="local GGUF file instead of downloading")
-    ap.add_argument("--output-dir", help="default: results/<model>-<quant>/<dataset>")
+    ap.add_argument("--output-dir", help="default: results/<model>-<quant>/<dataset>[-prompt<N>]")
     ap.add_argument("--n-ctx", type=int, default=8192, help="context window (prompt + output)")
     ap.add_argument("--max-tokens", type=int, default=4096, help="max generated tokens per attempt")
     ap.add_argument("--passes", type=int, default=1,
                     help="attempts per problem (k in pass@k); k > 1 needs --temperature > 0")
+    ap.add_argument("--prompt-style", type=int, default=PROMPT_STYLE, choices=sorted(PROMPT_STYLES),
+                    help=f"0 = original prompt, 1 = pushes harder for a code block (default {PROMPT_STYLE})")
     ap.add_argument("--temperature", type=float, default=0.0, help="0 = greedy")
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=0, help="0 = disabled")
@@ -513,7 +551,9 @@ def main():
         ap.error("--passes > 1 with --temperature 0 (greedy) gives identical attempts; "
                  "set a sampling temperature, e.g. --temperature 0.2")
 
-    out_dir = Path(args.output_dir).resolve() if args.output_dir else ROOT / "results" / f"{args.model}-{args.quant}" / args.dataset
+    # Style 0 keeps the original folder name; other styles get a suffix so they don't collide.
+    run_name = args.dataset if args.prompt_style == 0 else f"{args.dataset}-prompt{args.prompt_style}"
+    out_dir = Path(args.output_dir).resolve() if args.output_dir else ROOT / "results" / f"{args.model}-{args.quant}" / run_name
     (out_dir / "traces").mkdir(parents=True, exist_ok=True)
     config_path, state_path, results_path = out_dir / "config.json", out_dir / "state.json", out_dir / "results.jsonl"
 
@@ -525,12 +565,15 @@ def main():
               "n_ctx": args.n_ctx, "max_tokens": args.max_tokens, "temperature": args.temperature,
               "top_p": args.top_p, "top_k": args.top_k, "min_p": args.min_p,
               "repeat_penalty": args.repeat_penalty, "seed": args.seed, "passes": args.passes,
-              "prompt_version": PROMPT_VERSION, "system_prompt": SYSTEM_PROMPT,
-              "reasoning_instruction": REASONING_INSTRUCTION}
+              "prompt_version": PROMPT_VERSION, "prompt_style": args.prompt_style,
+              "system_prompt": PROMPT_STYLES[args.prompt_style]["system"],
+              "reasoning_instruction": PROMPT_STYLES[args.prompt_style]["instruction"],
+              "format_tail": PROMPT_STYLES[args.prompt_style]["format_tail"]}
 
     # ---- resume
     if config_path.exists():
         old = json.loads(config_path.read_text(encoding="utf-8"))
+        old.setdefault("prompt_style", 0)  # folders created before prompt styles existed
         diff = {k: (old.get(k), config[k]) for k in CONFIG_KEYS if old.get(k) != config[k]}
         if diff and not args.force:
             sys.exit(f"{out_dir} holds a run with different settings {diff}.\n"
