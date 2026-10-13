@@ -212,6 +212,22 @@ EvalPlus `check()` harness (base + extra tests) as one test.
   timeouts. Those limits stop runaway programs, not malicious ones.
 - `lcb_full` reads all ~4.4 GB of LiveCodeBench files once at startup to index them.
 
+## 5. Analysis (any machine)
+
+```bash
+uv pip install --python .venv matplotlib
+.venv/bin/python analysis/compare_results.py      # default: qwen lcb_easy vs monet lcb_easy-prompt1
+.venv/bin/python analysis/compare_results.py --qwen results/qwen25vl-Q8_0/humanevalplus \
+                                             --monet results/monet-Q8_0/humanevalplus
+```
+
+Writes `results/analysis/<qwen folder>__vs__<monet folder>/`: `report.md` (agreement table,
+failure categories, latent-token counts for every Monet run and the V* probe),
+`qwen_pass_monet_fail.csv`, `monet_pass_qwen_fail.csv` (one row per problem, with each
+attempt's status and links to both traces) and `failure_categories.png`. A problem counts
+as solved if any attempt passed. The report lists settings that differ between the two
+runs (e.g. prompt style), since those make the comparison unfair.
+
 ## Files
 
 | Path | What it is |
@@ -222,6 +238,7 @@ EvalPlus `check()` harness (base + extra tests) as one test.
 | `prepare_datasets.py` | Downloads data, builds subsets, writes stats |
 | `src/run_eval.py` | Runs one model on one dataset, saves traces, resumes |
 | `src/code_exec.py` | Runs generated code against the tests |
+| `analysis/compare_results.py` | Qwen vs Monet comparison, CSVs, heatmap, latent-token counts |
 | `latent_probe/` | Separate check: does quantized Monet emit its latent token on V* image questions? See its README |
 | `DATASET.md` | Data locations and formats |
 | `data/` | Datasets and stats (created by `setup.sh`) |
