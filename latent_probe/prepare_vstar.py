@@ -4,10 +4,12 @@ Build a small V* subset for the latent-token probe (see README.md in this folder
     source env.sh
     .venv/bin/python latent_probe/prepare_vstar.py            # 20 questions, 10 per category
     .venv/bin/python latent_probe/prepare_vstar.py --n 40
+    .venv/bin/python latent_probe/prepare_vstar.py --full     # all 191 questions
 
 Downloads only test_questions.jsonl and the selected images from the
 craigwu/vstar_bench dataset (into hf_cache/), then writes:
   latent_probe/data/vstar_subset.jsonl   one question per line, prompt in Monet's format
+                                         (vstar_full.jsonl with --full)
   latent_probe/data/images/              copies of the selected images
 """
 
@@ -24,6 +26,8 @@ HERE = Path(__file__).resolve().parent              # latent_probe/
 ROOT = HERE.parent                                  # project root
 HF_HUB_CACHE = ROOT / "hf_cache" / "hub"            # same place env.sh points HF_HOME to
 OUT = HERE / "data"
+SUBSET_FILE = OUT / "vstar_subset.jsonl"   # --n questions (the probe set)
+FULL_FILE = OUT / "vstar_full.jsonl"       # --full: every V* question
 REPO = "craigwu/vstar_bench"
 
 # V* ends every question with this line. "directly" asks for no reasoning, which
@@ -43,12 +47,8 @@ def monet_prompt(text):
             + f"\n{MONET_SUFFIX}")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n", type=int, default=20, help="number of questions, split evenly across the two categories")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
-
+def build(n=20, seed=0, full=False):
+    """Download the questions and images and write the jsonl; returns its path."""
     qfile = hf_hub_download(REPO, "test_questions.jsonl", repo_type="dataset", cache_dir=HF_HUB_CACHE)
     by_cat = defaultdict(list)
     with open(qfile, encoding="utf-8") as f:
@@ -57,11 +57,14 @@ def main():
                 r = json.loads(line)
                 by_cat[r["category"]].append(r)
 
-    rng = random.Random(args.seed)
+    rng = random.Random(seed)
     cats = sorted(by_cat)
     picked = []
     for i, cat in enumerate(cats):
-        k = args.n // len(cats) + (1 if i < args.n % len(cats) else 0)
+        if full:
+            picked += sorted(by_cat[cat], key=lambda r: int(r["question_id"]))
+            continue
+        k = n // len(cats) + (1 if i < n % len(cats) else 0)
         picked += sorted(rng.sample(by_cat[cat], k), key=lambda r: int(r["question_id"]))
 
     (OUT / "images").mkdir(parents=True, exist_ok=True)
@@ -80,11 +83,22 @@ def main():
             "label": r["label"],
         })
 
-    with open(OUT / "vstar_subset.jsonl", "w", encoding="utf-8") as f:
+    out_file = FULL_FILE if full else SUBSET_FILE
+    with open(out_file, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     counts = {c: sum(r["category"] == c for r in rows) for c in cats}
-    print(f"wrote {len(rows)} questions {counts} to {OUT / 'vstar_subset.jsonl'}")
+    print(f"wrote {len(rows)} questions {counts} to {out_file}")
+    return out_file
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--n", type=int, default=20, help="number of questions, split evenly across the two categories")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--full", action="store_true", help="all V* questions, written to vstar_full.jsonl")
+    args = ap.parse_args()
+    build(args.n, args.seed, args.full)
 
 
 if __name__ == "__main__":

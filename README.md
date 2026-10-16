@@ -201,7 +201,7 @@ EvalPlus `check()` harness (base + extra tests) as one test.
 
 ### Notes
 
-- **Monet's latent mode does not run here.** Latent reasoning needs Monet's patched vLLM
+- **Monet's latent mode does not run here** (`monet_latent/` has a llama.cpp port, used for V*). Latent reasoning needs Monet's patched vLLM
   runner. Under llama.cpp, Monet is a plain text model. If it emits token 151666, the
   token is decoded as text and generation continues normally; `latent_token_count`
   records how often that happens.
@@ -240,6 +240,7 @@ runs (e.g. prompt style), since those make the comparison unfair.
 | `src/code_exec.py` | Runs generated code against the tests |
 | `analysis/compare_results.py` | Qwen vs Monet comparison, CSVs, heatmap, latent-token counts |
 | `latent_probe/` | Separate check: does quantized Monet emit its latent token on V* image questions? See its README |
+| `monet_latent/` | Monet with real latent reasoning on llama.cpp (GGUF), and a V* runner (`--dataset probe` / `full`). See its README |
 | `DATASET.md` | Data locations and formats |
 | `data/` | Datasets and stats (created by `setup.sh`) |
 | `hf_cache/` | Hugging Face cache, including the GGUF models |
