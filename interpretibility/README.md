@@ -641,3 +641,66 @@ At 14 KiB per generated token (3,584 × float32):
 
 - **Category balance:** all 30 Step 1 traces are `direct_attributes`, so
   category balancing has no effect.
+
+## Step 0 review helpers (not in the plan)
+
+Both use only the standard library and default to the judged folder
+`results/step0_judge/results/step0` (`--step0` to change).
+
+- `src/analysis/list_no_latent_start.py`: lists records whose generated tokens
+  contain no `<abs_vis_token>` (default settings `noise,no_image`). Writes
+  `<step0>/review_no_latent_start/no_latent_start.{csv,md}`; the `.md` is a
+  checklist with trace links and whether the same question started latents
+  in each setting. Current result: noise 9 (5 correct), no_image 11 (6
+  correct); none in either: vstar_069, 149, 162, 186.
+- `src/analysis/agreement_step0.py`: answer agreement between two settings
+  (default noise vs no_image): % same letter and Cohen's kappa on questions
+  both answered, plus correctness agreement and kappa, with 95% bootstrap CIs
+  (2000 draws, seed 0), by category and by latent start. `--answer-source
+  effective` (default) fills a missing prediction with the judge's verified
+  letter even if wrong; `boxed` uses the scored prediction only. Writes
+  `<step0>/agreement/agreement_<a>_vs_<b>.{json,md,csv}`. Current result:
+  74.6% same answer [68.4, 80.6], kappa 0.618; correctness agreement 81.7%,
+  kappa 0.622.
+
+## Step 0 control: Qwen2.5-VL-7B-Instruct (not in the plan)
+
+Is the image hallucination Monet-specific? `src/modal/run_qwen_step0.py` runs
+Qwen2.5-VL-7B-Instruct on V* in any of `real`, `noise`, `no_image`
+(`--settings`, default `noise,no_image`; one at a time works and resumes) with **plain vLLM 0.10.0, no Monet patch**. Everything else is
+the same code as Step 0, imported rather than copied:
+
+| Kept identical | How |
+|---|---|
+| Engine + sampling (seed 0, T 0.1, top-k 50, top-p 0.8, rep. 1.01, 4096 tokens, max_num_seqs 512, min/max pixels, eager, chunked prefill; tp 1, gpu util 0.85, max_model_len 16384) | Monet's `vllm_mllm_init`, same call as `run_step0.py` |
+| System prompt, user prompt, message layout | `run_step0.build_inputs` |
+| Noise pixels | Step 0's PNGs copied byte for byte from `/vol/results/<step0_dir>/noise_images` |
+| Scoring, traces, summaries, `state.json`, `per_question.csv` | `run_vstar` / `run_step0` helpers |
+| `VLLM_USE_V1=1`, `VLLM_NO_USAGE_STATS=1` | set as Monet's patch sets them |
+
+Keeping the patch out: `run_step0.py` begins with `import
+inference.apply_vllm_monet`. The Qwen script first registers an empty module
+under that name, so the import is a no-op (also in vLLM's spawned engine
+process, which re-imports the script). It then checks that vLLM's GPU runner
+is vLLM's own file and exits otherwise. `--check-template` (on by default in
+Modal) renders every prompt with both Qwen's and Monet's processors and stops
+if any string differs. Differences in output: trace header `"model":
+"qwen2.5-vl-7b-instruct"`, `latent_size: null`, records carry `"model"`.
+
+```bash
+modal run src/modal/monet_vstar_modal.py::run_qwen_step0 --limit 2     # smoke test
+modal run --detach src/modal/monet_vstar_modal.py::run_qwen_step0      # full run
+modal volume get monet-vstar results/qwen_step0 ./results/qwen_step0
+```
+
+Resumes per setting via `state.json`, like Step 0. Afterwards the review
+scripts work on the folder unchanged: `rejudge_step0.py --step0
+results/qwen_step0` (now reads the model label and `latent_size` from the
+folder and defaults to the settings present), `agreement_step0.py --step0
+results/qwen_step0`.
+
+Local tests (stubbed vLLM/pandas): the real Monet `apply_vllm_monet` is not
+executed, a patched runner is detected, a fake Qwen folder built with the
+real trace/summary code passes the judge (smoke and full) and agreement
+scripts, and the judge still gives byte-identical output on Monet's Step 0.
+Not run on Modal.

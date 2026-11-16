@@ -246,13 +246,13 @@ def json_block(data):
     return code_block(json.dumps(data, indent=2, ensure_ascii=False), "json")
 
 
-def render_trace(record, latent_size, seed):
+def render_trace(record, latent_size, seed, model="monet-7b"):
     """run_vstar.render_trace. For a judged record the trace also shows the judge's reading
     and, if it was accepted, the corrected status and answer."""
     problem_id = f"vstar_{record['index']:03d}"
     label = record["status"].upper()
     passed = int(record["correct"])
-    meta = {"id": problem_id, "dataset": "vstar", "model": "monet-7b", "index": record["index"],
+    meta = {"id": problem_id, "dataset": "vstar", "model": model, "index": record["index"],
             "category": record["category"], "latent_size": latent_size, "format": "mcq",
             "status": record["status"], "passes": 1, "num_attempts_passed": passed}
     attempt = {"attempt": 0, "seed": seed, "status": record["status"],
@@ -311,6 +311,13 @@ def trace_seed(text: str) -> int:
     return int(m.group(1))
 
 
+def trace_model(text: str) -> str:
+    m = re.search(r'"model": "([^"]+)"', text)
+    if not m:
+        raise ValueError("no model in trace")
+    return m.group(1)
+
+
 # ---------------------------------------------------------------- files
 
 def read_jsonl(path: Path) -> list:
@@ -352,24 +359,25 @@ def load_original(src: Path, setting: str) -> tuple[list, dict]:
     if any("judge" in r for r in records):
         sys.exit(f"ERROR: {src / setting} already contains judged records; it is not an original.")
     saved = json.loads((src / setting / "summary.json").read_text())
-    extra = {k: saved[k] for k in ("latent_size", "setting") if k in saved}
+    extra = {k: saved[k] for k in ("latent_size", "setting", "model") if k in saved}
     if summarize(records, extra) != saved:
         sys.exit(f"ERROR: recomputed summary for {setting} differs from {src / setting}/summary.json; "
                  "not changing anything.")
     return records, saved
 
 
-def check_trace_reproduction(src: Path, setting: str, records: list, latent_size: int) -> int:
+def check_trace_reproduction(src: Path, setting: str, records: list, latent_size) -> tuple:
     """Re-render every original trace and require a byte-for-byte match before rewriting any.
-    Returns the engine seed read from the traces."""
-    seed = None
+    Returns the engine seed and model label read from the traces."""
+    seed = model = None
     for r in records:
         path = src / setting / "traces" / f"vstar_{r['index']:03d}.md"
         text = path.read_text(encoding="utf-8")
-        seed = trace_seed(text) if seed is None else seed
-        if add_setting_line(render_trace(r, latent_size, seed), setting, r) != text:
+        if seed is None:
+            seed, model = trace_seed(text), trace_model(text)
+        if add_setting_line(render_trace(r, latent_size, seed, model), setting, r) != text:
             sys.exit(f"ERROR: cannot reproduce {path} exactly; not rewriting traces.")
-    return seed
+    return seed, model
 
 
 # ---------------------------------------------------------------- judging
@@ -547,7 +555,8 @@ def main():
     ap.add_argument("--num-ctx", type=int, default=8192)
     ap.add_argument("--timeout", type=float, default=600, help="seconds per Ollama request")
     ap.add_argument("--retries", type=int, default=3)
-    ap.add_argument("--settings", default=",".join(SETTINGS))
+    ap.add_argument("--settings", default="",
+                    help="comma-separated; default: every setting with predictions in --step0")
     ap.add_argument("--smoke", type=int, default=0,
                     help="judge N incorrect records per setting (no_answer first) into "
                          "<step0>/rejudge_smoke/ and change nothing in the step0 folder")
@@ -558,9 +567,13 @@ def main():
     args = ap.parse_args()
 
     step0 = args.step0
-    settings = [s.strip() for s in args.settings.split(",") if s.strip()]
+    settings = [s.strip() for s in args.settings.split(",") if s.strip()] or [
+        s for s in SETTINGS if (step0 / s / "predictions.jsonl").exists()
+        or (step0 / "rejudge" / "original" / s / "predictions.jsonl").exists()]
     if bad := [s for s in settings if s not in SETTINGS]:
         sys.exit(f"ERROR: unknown settings {bad}")
+    if not settings:
+        sys.exit(f"ERROR: no predictions found in {step0}")
     if missing := [s for s in settings if not (step0 / s / "predictions.jsonl").exists()]:
         sys.exit(f"ERROR: {step0} has no predictions for {missing}")
 
@@ -571,11 +584,11 @@ def main():
     src = backup if (backup / settings[0] / "predictions.jsonl").exists() else step0
 
     step0_state = json.loads((src / "state.json").read_text())
-    latent_size = int(step0_state["latent_size"])
+    latent_size = step0_state["latent_size"]  # None for runs without latent mode (Qwen)
     originals, seeds = {}, {}
     for s in settings:
         records, _ = load_original(src, s)
-        seeds[s] = check_trace_reproduction(src, s, records, latent_size)
+        seeds[s] = check_trace_reproduction(src, s, records, latent_size)  # (seed, model)
         originals[s] = records
     print("Original summaries and traces reproduce exactly.")
 
@@ -615,7 +628,7 @@ def main():
                                  not args.no_require_evidence, args.model) for r in originals[s]]
         cnt[s] = counts(new[s])
         saved = json.loads((src / s / "summary.json").read_text())
-        extra = {k: saved[k] for k in ("latent_size", "setting") if k in saved}
+        extra = {k: saved[k] for k in ("latent_size", "setting", "model") if k in saved}
         before[s] = setting_stats(summarize(originals[s], extra))
         summary = summarize(new[s], extra)
         summary["judge"] = {"model": args.model, "think": args.think,
@@ -634,7 +647,7 @@ def main():
             for r in new[s]:
                 if "judge" in r:
                     write_text(d / f"vstar_{r['index']:03d}.md",
-                               add_setting_line(render_trace(r, latent_size, seeds[s]), s, r))
+                               add_setting_line(render_trace(r, latent_size, *seeds[s]), s, r))
         report(work / "report.md", settings, before, after, cnt, new, args.model, title)
         run_state.update(status="smoke_done", counts=cnt)
         write_json(state_path, run_state)
@@ -656,7 +669,7 @@ def main():
         write_json(d / "summary.json", new[s + "__summary"])
         for r in new[s]:
             write_text(d / "traces" / f"vstar_{r['index']:03d}.md",
-                       add_setting_line(render_trace(r, latent_size, seeds[s]), s, r))
+                       add_setting_line(render_trace(r, latent_size, *seeds[s]), s, r))
 
     # Current state, so settings judged in an earlier run keep their judged stats.
     state = json.loads((step0 / "state.json").read_text())
@@ -675,8 +688,8 @@ def main():
     md = table(done, stats, [("vLLM preemptions", {s: state["settings"][s].get("preemptions") for s in done}),
                              ("Correct before judge (\\boxed{} only)", orow),
                              ("Corrected by judge", jrow)])
-    write_text(step0 / "summary.md",
-               "# Step 0: Monet-7B on V*, three settings\n\n"
+    md_title = (backup / "summary.md").read_text(encoding="utf-8").split("\n", 1)[0]
+    write_text(step0 / "summary.md", md_title + "\n\n"
                f"Unboxed answers re-read by `{args.model}`; see `rejudge/report.md`. "
                "Originals are in `rejudge/original/`.\n\n" + md + "\n")
     per_question_csv(step0 / "per_question.csv", per_setting)

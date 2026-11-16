@@ -202,7 +202,7 @@ EvalPlus `check()` harness (base + extra tests) as one test.
 ### Notes
 
 - **Monet's latent mode does not run here.** Latent reasoning needs Monet's patched vLLM
-  runner. Under llama.cpp, Monet is a plain text model. If it emits token 151666, the
+  runner (see section 6). Under llama.cpp, Monet is a plain text model. If it emits token 151666, the
   token is decoded as text and generation continues normally; `latent_token_count`
   records how often that happens.
 - **HumanEval/32 fails for every solution.** In the `evalplus/humanevalplus` data its
@@ -228,6 +228,48 @@ attempt's status and links to both traces) and `failure_categories.png`. A probl
 as solved if any attempt passed. The report lists settings that differ between the two
 runs (e.g. prompt style), since those make the comparison unfair.
 
+## 6. Monet with latent mode (Modal GPU)
+
+Runs the full bf16 Monet-7B through its patched vLLM runner, so latent mode is actually on,
+and writes the same output as `src/run_eval.py`. Needs a configured `modal` CLI and
+`data/lcb_easy.jsonl`, which the command uploads.
+
+```bash
+modal run src/modal/monet_vstar_modal.py::run_lcb --limit 2     # smoke test, separate -first2 folder
+modal run --detach src/modal/monet_vstar_modal.py::run_lcb      # all 322 problems
+modal volume get monet-vstar results/monet-vllm-latent10 ./results/
+
+.venv/bin/python analysis/compare_results.py --qwen results/qwen25vl-Q8_0/lcb_easy-prompt1 \
+                                             --monet results/monet-vllm-latent10/lcb_easy-prompt1
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--limit` | 0 (all) | Only the first N problems |
+| `--dataset` | `lcb_easy` | Any `data/<name>.jsonl`, e.g. `lcb_post_qwen25vl` |
+| `--passes` | 3 | Attempts per problem |
+| `--temperature` | 0.7 | Same as the GGUF `lcb_easy-prompt1` runs (Monet's own default is 0.1) |
+| `--prompt-style` | 1 | Prompt style from `src/run_eval.py` |
+| `--latent-size` | 10 | Maximum tokens in a latent segment |
+| `--batch-problems` | 4 | Problems generated together. Higher is faster but risks preemption |
+| `--retry-errors` | | Re-run attempts whose status is `error` |
+| `--force` | | Resume even if settings differ from the saved `config.json` |
+
+Rerun the same command to resume: a batch is saved to `results.jsonl` and `state.json` as soon
+as it finishes, so a crash loses at most the batch that was running.
+
+Results are in `results/monet-vllm-latent<N>/<dataset>-prompt<S>/`, with the files and record
+fields from section 4, except:
+
+- `raw_output` keeps latent segments. `reasoning` shows each as `<latent>`, and they are
+  removed from `final_code` before it is tested.
+- `latent_token_count` is the number of latent segments started; `latent_inner_tokens` counts
+  the tokens inside them.
+- `gen_seconds` is null, since a batch has no per-request timing; see `batch_seconds`.
+- `summary.json` adds `attempts_with_latent`, `attempts_without_latent` and `preemptions`.
+  Preemption can break the latent loop, so if `preemptions` is above 0, check the attempts with
+  `batch_preemptions` above 0 and use a smaller `--batch-problems`.
+
 ## Files
 
 | Path | What it is |
@@ -238,6 +280,8 @@ runs (e.g. prompt style), since those make the comparison unfair.
 | `prepare_datasets.py` | Downloads data, builds subsets, writes stats |
 | `src/run_eval.py` | Runs one model on one dataset, saves traces, resumes |
 | `src/code_exec.py` | Runs generated code against the tests |
+| `src/modal/monet_vstar_modal.py` | Modal entrypoints, including `run_lcb` (section 6) |
+| `src/modal/run_lcb.py` | Monet with latent mode on LiveCodeBench, run inside Modal |
 | `analysis/compare_results.py` | Qwen vs Monet comparison, CSVs, heatmap, latent-token counts |
 | `latent_probe/` | Separate check: does quantized Monet emit its latent token on V* image questions? See its README |
 | `DATASET.md` | Data locations and formats |
